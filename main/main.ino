@@ -4,6 +4,7 @@
 #include "icm.h"
 #include "ekf.h"
 #include "pid.h"
+#include "pm02d.h"
 
 // ==================================================
 // TEENSY 4.1 PIN CONFIGURATION
@@ -53,6 +54,15 @@ PID_struct yaw_pid;
 SPISettings spiSettings(1000000, MSBFIRST, SPI_MODE0);
 MPU9250 mpu(MPU_CS_PIN, spiSettings);
 ICM20948 icm(ICM_CS_PIN, spiSettings);
+PM02D powerMonitor(Wire, PM02D_I2C_ADDR);
+PM02D_Data powerData = {
+    0.0f,
+    0.0f,
+    0.0f,
+    0.0f,
+    0.0f,
+    false
+};
 
 EKF_IMU fusedEKF(0.005f, 0.6f);
 
@@ -144,6 +154,8 @@ float read_throttle()
 // SETUP
 // ==================================================
 void setup() {
+  Wire.begin();
+  Wire.setClock(400000);
   Serial.begin(115200);
   pinMode(rx_pin, INPUT);
   attachInterrupt(digitalPinToInterrupt(rx_pin), ppm_isr, RISING);
@@ -167,6 +179,12 @@ void setup() {
   uint8_t icmWho = 0;
   if (!icm.begin(icmWho)) {
     while (1); // Halt on sensor failure
+  }
+
+  if (!powerMonitor.begin()) {
+      Serial.println("PM02D / INA228 NOT FOUND!");
+  } else {
+      Serial.println("PM02D / INA228 detected.");
   }
 
   // Calibrate IMUs on boot up
@@ -244,6 +262,14 @@ void loop() {
   fusedEKF.update(mpu_ax, mpu_ay, mpu_az);
   fusedEKF.update(icm_ax, icm_ay, icm_az);
 
+  static uint32_t powerTimer = 0;
+
+  if (millis() - powerTimer >= 100){
+    powerTimer = millis();
+    powerMonitor.read(powerData);
+  }
+
+
   // 4. Closed-loop control
   if (baseThrottlePercent > 0.0f) {
     float angle_kp = 4.0f;
@@ -296,16 +322,21 @@ void loop() {
   {
       debugTimer = millis();
 
-      char plotBuffer[128];
+      char plotBuffer[256];
       snprintf(plotBuffer, sizeof(plotBuffer),
-               "Throttle:%.2f Roll:%.2f Pitch:%.2f M1:%.2f M2:%.2f M3:%.2f M4:%.2f",
-               baseThrottlePercent,
-               fusedEKF.roll,
-               fusedEKF.pitch,
-               filtered_m1,
-               filtered_m2,
-               filtered_m3,
-               filtered_m4);
+              "Throttle:%.2f Roll:%.2f Pitch:%.2f "
+              "M1:%.2f M2:%.2f M3:%.2f M4:%.2f "
+              "Voltage:%.2f Current:%.2f Power:%.2f",
+              baseThrottlePercent,
+              fusedEKF.roll,
+              fusedEKF.pitch,
+              filtered_m1,
+              filtered_m2,
+              filtered_m3,
+              filtered_m4,
+              powerData.voltageV,
+              powerData.currentA,
+              powerData.powerW);
 
       Serial.println(plotBuffer);
   }
