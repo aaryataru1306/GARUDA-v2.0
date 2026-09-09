@@ -5,6 +5,7 @@
 #include "ekf.h"
 #include "pid.h"
 #include "pm02d.h"
+#include <SD.h>
 
 // ==================================================
 // TEENSY 4.1 PIN CONFIGURATION
@@ -18,6 +19,7 @@ volatile uint32_t ppm_last_edge = 0;
 volatile uint8_t ppm_channel = 0;
 volatile uint16_t ppm_channels[PPM_MAX_CHANNELS];
 volatile uint32_t ppm_last_signal = 0;
+#define SD_CS BUILTIN_SDCARD
 
 constexpr int MOTOR1_PIN = 22; // Front Right (CCW)
 constexpr int MOTOR2_PIN = 4;  // Rear Right  (CW)
@@ -43,6 +45,10 @@ float filtered_m1 = 0.0f;
 float filtered_m2 = 0.0f;
 float filtered_m3 = 0.0f;
 float filtered_m4 = 0.0f;
+File logFile;
+
+uint32_t logTimer = 0;
+uint32_t logStartTime = 0;
 
 // ==================================================
 // OBJECTS & GLOBALS
@@ -144,8 +150,7 @@ float read_throttle()
         return 0.0f;
     }
 
-    float throttle =
-        (throttlePulse - 1000.0f) / 10.0f;
+    float throttle = (throttlePulse - 1000.0f) / 10.0f;
 
     return constrain(throttle, 0.0f, 100.0f);
 }
@@ -157,6 +162,38 @@ void setup() {
   Wire.begin();
   Wire.setClock(400000);
   Serial.begin(115200);
+
+  // ==================================================
+  // SD CARD INITIALIZATION
+  // ==================================================
+  if (!SD.begin(BUILTIN_SDCARD)) {
+      Serial.println("SD CARD INIT FAILED!");
+  }
+  else {
+      Serial.println("SD CARD INITIALIZED.");
+
+      logFile = SD.open("flight.csv", FILE_WRITE);
+
+      if (logFile) {
+          // Write CSV header only if file is new/empty
+          if (logFile.size() == 0) {
+              logFile.println(
+                  "Time_ms,Throttle,Roll,Pitch,"
+                  "M1,M2,M3,M4,"
+                  "Voltage,Current,Power"
+              );
+              logFile.flush();
+          }
+
+          logStartTime = millis();
+
+          Serial.println("LOGGING STARTED.");
+      }
+      else {
+          Serial.println("FAILED TO OPEN flight.csv");
+      }
+  }
+
   pinMode(rx_pin, INPUT);
   attachInterrupt(digitalPinToInterrupt(rx_pin), ppm_isr, RISING);
 
@@ -192,9 +229,9 @@ void setup() {
   icm.calibrate();
 
   // Initialize PID rate controllers with safe bench values (Ki = 0.0 to prevent windup)
-  PID_init(&roll_pid, 0.2f, 0.002f, 0.005f, -15.0f, 15.0f);
-  PID_init(&pitch_pid, 0.2f, 0.001f, 0.003f, -15.0f, 15.0f);
-  PID_init(&yaw_pid, 0.0f, 0.0f, 0.00f, -10.0f, 10.0f);
+  PID_init(&roll_pid, 0.01f, 0.002f, 0.01f, -15.0f, 15.0f);
+  PID_init(&pitch_pid, 0.01f, 0.001f, 0.01f, -15.0f, 15.0f);
+  PID_init(&yaw_pid, 0.01f, 0.001f, 0.0001f, -10.0f, 10.0f);
 
   // Holding disarm pulse (1000us) for 3s to allow standard ESC initialization chimes
   uint32_t armStart = millis();
@@ -247,20 +284,30 @@ void loop() {
   mpu.getMotion6(mpu_ax, mpu_ay, mpu_az, mpu_gx, mpu_gy, mpu_gz);
   icm.getMotion6(icm_ax, icm_ay, icm_az, icm_gx, icm_gy, icm_gz);
 
-  // 2. Average rates (rad/s)
-  float fused_gx_rad = 0.5f * (mpu_gx + icm_gx);
-  float fused_gy_rad = 0.5f * (mpu_gy + icm_gy);
-  float fused_gz_rad = 0.5f * (mpu_gz + icm_gz);
+  // Convert ICM20948 coordinates into MPU9250 / CanSat BODY frame
+  // Transformation Matrix: [X_body = X_icm, Y_body = -Y_icm, Z_body = -Z_icm]
+  float icm_ax_body =  icm_ax;
+  float icm_ay_body = -icm_ay;
+  float icm_az_body = -icm_az;
+
+  float icm_gx_body =  icm_gx;
+  float icm_gy_body = -icm_gy;
+  float icm_gz_body = -icm_gz;
+
+  // 2. Average rates (rad/s) in unified BODY frame
+  float fused_gx_rad = 0.5f * (mpu_gx + icm_gx_body);
+  float fused_gy_rad = 0.5f * (mpu_gy + icm_gy_body);
+  float fused_gz_rad = 0.5f * (mpu_gz + icm_gz_body);
 
   // Convert angular rates to deg/s
   float fused_gx_deg = fused_gx_rad * (180.0f / M_PI);
   float fused_gy_deg = fused_gy_rad * (180.0f / M_PI);
   float fused_gz_deg = fused_gz_rad * (180.0f / M_PI);
 
-  // 3. EKF Filter Update
+  // 3. EKF Filter Update with aligned sensor frames
   fusedEKF.predict(fused_gx_rad, fused_gy_rad, fused_gz_rad, dt);
   fusedEKF.update(mpu_ax, mpu_ay, mpu_az);
-  fusedEKF.update(icm_ax, icm_ay, icm_az);
+  fusedEKF.update(icm_ax_body, icm_ay_body, icm_az_body);
 
   static uint32_t powerTimer = 0;
 
@@ -269,17 +316,15 @@ void loop() {
     powerMonitor.read(powerData);
   }
 
-
   // 4. Closed-loop control
   if (baseThrottlePercent > 0.0f) {
     float angle_kp = 4.0f;
     float desired_roll_rate  = angle_kp * (0.0f - fusedEKF.roll);
-    float desired_pitch_rate  = angle_kp * (0.0f - fusedEKF.pitch);
-    //float desired_yaw_rate  = angle_kp * (0.0f - fusedEKF.yaw);
+    float desired_pitch_rate = angle_kp * (0.0f - fusedEKF.pitch);
 
-    float roll_output  = PID_update(&roll_pid,  desired_roll_rate,  fused_gx_deg, dt);
-    float pitch_output = PID_update(&pitch_pid, desired_pitch_rate, fused_gy_deg, dt);
-    float yaw_output   = PID_update(&yaw_pid,   0.0f,   fused_gz_deg, dt);
+    float roll_output  = PID_update(&roll_pid,  0.0f,  fused_gx_deg, dt);
+    float pitch_output = PID_update(&pitch_pid, 0.0, fused_gy_deg, dt);
+    float yaw_output   = PID_update(&yaw_pid,   0.0f,fused_gz_deg, dt);
 
     // Quad X Motor Mix
     m1_throttle = baseThrottlePercent + pitch_output - roll_output - yaw_output;
@@ -315,6 +360,24 @@ void loop() {
   writeMotorThrottle(MOTOR3_PIN, filtered_m3);
   writeMotorThrottle(MOTOR4_PIN, filtered_m4);
 
+  // --- Temporary Coordinate Alignment Debug Output ---
+  static uint32_t alignDebugTimer = 0;
+  if (millis() - alignDebugTimer >= 100) // 10 Hz rate for easy serial viewing
+  {
+      alignDebugTimer = millis();
+      char debugBuf[256];
+      snprintf(debugBuf, sizeof(debugBuf),
+               "GX:[%.2f, %.2f] GY:[%.2f, %.2f] GZ:[%.2f, %.2f] | AX:[%.2f, %.2f] AY:[%.2f, %.2f] AZ:[%.2f, %.2f] | ROLL:%.2f PITCH:%.2f",
+               mpu_gx, icm_gx_body,
+               mpu_gy, icm_gy_body,
+               mpu_gz, icm_gz_body,
+               mpu_ax, icm_ax_body,
+               mpu_ay, icm_ay_body,
+               mpu_az, icm_az_body,
+               fusedEKF.roll, fusedEKF.pitch);
+      Serial.println(debugBuf);
+  }
+
   // --- Arduino Serial Plotter Standard Output ---
   static uint32_t debugTimer = 0;
 
@@ -339,6 +402,50 @@ void loop() {
               powerData.powerW);
 
       Serial.println(plotBuffer);
+
+    if (logFile){
+        logFile.print(millis() - logStartTime);
+        logFile.print(",");
+
+        logFile.print(baseThrottlePercent, 2);
+        logFile.print(",");
+
+        logFile.print(fusedEKF.roll, 2);
+        logFile.print(",");
+
+        logFile.print(fusedEKF.pitch, 2);
+        logFile.print(",");
+
+        logFile.print(filtered_m1, 2);
+        logFile.print(",");
+
+        logFile.print(filtered_m2, 2);
+        logFile.print(",");
+
+        logFile.print(filtered_m3, 2);
+        logFile.print(",");
+
+        logFile.print(filtered_m4, 2);
+        logFile.print(",");
+
+        logFile.print(powerData.voltageV, 2);
+        logFile.print(",");
+
+        logFile.print(powerData.currentA, 2);
+        logFile.print(",");
+
+        logFile.println(powerData.powerW, 2);
+    }
+
+    static uint32_t flushTimer = 0;
+
+    if (millis() - flushTimer >= 1000)
+    {
+        flushTimer = millis();
+
+        if (logFile)
+            logFile.flush();
+    }
   }
   delay(2);
 }
