@@ -229,9 +229,9 @@ void setup() {
   icm.calibrate();
 
   // Initialize PID rate controllers with safe bench values (Ki = 0.0 to prevent windup)
-  PID_init(&roll_pid, 0.01f, 0.002f, 0.01f, -15.0f, 15.0f);
-  PID_init(&pitch_pid, 0.01f, 0.001f, 0.01f, -15.0f, 15.0f);
-  PID_init(&yaw_pid, 0.01f, 0.001f, 0.0001f, -10.0f, 10.0f);
+  PID_init(&roll_pid, 0.2f, 0.002f, 0.005f, -15.0f, 15.0f);
+  PID_init(&pitch_pid, 0.2f, 0.001f, 0.003f, -15.0f, 15.0f);
+  PID_init(&yaw_pid, 0.5f, 0.0f, 0.01f, -15.0f, 15.0f);
 
   // Holding disarm pulse (1000us) for 3s to allow standard ESC initialization chimes
   uint32_t armStart = millis();
@@ -322,9 +322,9 @@ void loop() {
     float desired_roll_rate  = angle_kp * (0.0f - fusedEKF.roll);
     float desired_pitch_rate = angle_kp * (0.0f - fusedEKF.pitch);
 
-    float roll_output  = PID_update(&roll_pid,  0.0f,  fused_gx_deg, dt);
-    float pitch_output = PID_update(&pitch_pid, 0.0, fused_gy_deg, dt);
-    float yaw_output   = PID_update(&yaw_pid,   0.0f,fused_gz_deg, dt);
+    float roll_output  = PID_update(&roll_pid,  desired_roll_rate, fused_gx_deg, dt);
+    float pitch_output = PID_update(&pitch_pid, desired_pitch_rate, fused_gy_deg, dt);
+    float yaw_output   = PID_update(&yaw_pid,   0.0f, fused_gz_deg, dt);
 
     // Quad X Motor Mix
     m1_throttle = baseThrottlePercent + pitch_output - roll_output - yaw_output;
@@ -360,24 +360,6 @@ void loop() {
   writeMotorThrottle(MOTOR3_PIN, filtered_m3);
   writeMotorThrottle(MOTOR4_PIN, filtered_m4);
 
-  // --- Temporary Coordinate Alignment Debug Output ---
-  static uint32_t alignDebugTimer = 0;
-  if (millis() - alignDebugTimer >= 100) // 10 Hz rate for easy serial viewing
-  {
-      alignDebugTimer = millis();
-      char debugBuf[256];
-      snprintf(debugBuf, sizeof(debugBuf),
-               "GX:[%.2f, %.2f] GY:[%.2f, %.2f] GZ:[%.2f, %.2f] | AX:[%.2f, %.2f] AY:[%.2f, %.2f] AZ:[%.2f, %.2f] | ROLL:%.2f PITCH:%.2f",
-               mpu_gx, icm_gx_body,
-               mpu_gy, icm_gy_body,
-               mpu_gz, icm_gz_body,
-               mpu_ax, icm_ax_body,
-               mpu_ay, icm_ay_body,
-               mpu_az, icm_az_body,
-               fusedEKF.roll, fusedEKF.pitch);
-      Serial.println(debugBuf);
-  }
-
   // --- Arduino Serial Plotter Standard Output ---
   static uint32_t debugTimer = 0;
 
@@ -387,12 +369,13 @@ void loop() {
 
       char plotBuffer[256];
       snprintf(plotBuffer, sizeof(plotBuffer),
-              "Throttle:%.2f Roll:%.2f Pitch:%.2f "
+              "Throttle:%.2f Roll:%.2f Pitch:%.2f Yaw:%.2f "
               "M1:%.2f M2:%.2f M3:%.2f M4:%.2f "
-              "Voltage:%.2f Current:%.2f Power:%.2f",
+              "Voltage:%.2f Current:%.2f Power:%.2f ",
               baseThrottlePercent,
               fusedEKF.roll,
               fusedEKF.pitch,
+              fusedEKF.yaw,
               filtered_m1,
               filtered_m2,
               filtered_m3,
