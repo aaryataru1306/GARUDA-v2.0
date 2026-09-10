@@ -57,6 +57,7 @@ PID_struct roll_pid;
 PID_struct pitch_pid;
 PID_struct yaw_pid;
 
+
 SPISettings spiSettings(1000000, MSBFIRST, SPI_MODE0);
 MPU9250 mpu(MPU_CS_PIN, spiSettings);
 ICM20948 icm(ICM_CS_PIN, spiSettings);
@@ -150,7 +151,8 @@ float read_throttle()
         return 0.0f;
     }
 
-    float throttle = (throttlePulse - 1000.0f) / 10.0f;
+    float throttle =
+        (throttlePulse - 1000.0f) / 10.0f;
 
     return constrain(throttle, 0.0f, 100.0f);
 }
@@ -164,8 +166,9 @@ void setup() {
   Serial.begin(115200);
 
   // ==================================================
-  // SD CARD INITIALIZATION
-  // ==================================================
+// SD CARD INITIALIZATION
+// ==================================================
+
   if (!SD.begin(BUILTIN_SDCARD)) {
       Serial.println("SD CARD INIT FAILED!");
   }
@@ -229,9 +232,9 @@ void setup() {
   icm.calibrate();
 
   // Initialize PID rate controllers with safe bench values (Ki = 0.0 to prevent windup)
-  PID_init(&roll_pid, 0.2f, 0.002f, 0.005f, -15.0f, 15.0f);
+  PID_init(&roll_pid, 0.5f, 0.002f, 0.05f, -15.0f, 15.0f);
   PID_init(&pitch_pid, 0.2f, 0.001f, 0.003f, -15.0f, 15.0f);
-  PID_init(&yaw_pid, 0.5f, 0.0f, 0.01f, -15.0f, 15.0f);
+  PID_init(&yaw_pid, 0.2f, 0.001f, 0.03f, -10.0f, 10.0f);
 
   // Holding disarm pulse (1000us) for 3s to allow standard ESC initialization chimes
   uint32_t armStart = millis();
@@ -248,9 +251,7 @@ float smoothThrottle(float target, float current, float alpha)
     return current + alpha * (target - current);
 }
 
-// ==================================================
-// LOOP
-// ==================================================
+
 void loop() {
   // --- Receiver / Serial Input ---
   float read_PWM = read_throttle();
@@ -284,30 +285,20 @@ void loop() {
   mpu.getMotion6(mpu_ax, mpu_ay, mpu_az, mpu_gx, mpu_gy, mpu_gz);
   icm.getMotion6(icm_ax, icm_ay, icm_az, icm_gx, icm_gy, icm_gz);
 
-  // Convert ICM20948 coordinates into MPU9250 / CanSat BODY frame
-  // Transformation Matrix: [X_body = X_icm, Y_body = -Y_icm, Z_body = -Z_icm]
-  float icm_ax_body =  icm_ax;
-  float icm_ay_body = -icm_ay;
-  float icm_az_body = -icm_az;
-
-  float icm_gx_body =  icm_gx;
-  float icm_gy_body = -icm_gy;
-  float icm_gz_body = -icm_gz;
-
-  // 2. Average rates (rad/s) in unified BODY frame
-  float fused_gx_rad = 0.5f * (mpu_gx + icm_gx_body);
-  float fused_gy_rad = 0.5f * (mpu_gy + icm_gy_body);
-  float fused_gz_rad = 0.5f * (mpu_gz + icm_gz_body);
+  // 2. Average rates (rad/s)
+  float fused_gx_rad = 0.5f * (mpu_gx + icm_gx);
+  float fused_gy_rad = 0.5f * (mpu_gy + icm_gy);
+  float fused_gz_rad = 0.5f * (mpu_gz + icm_gz);
 
   // Convert angular rates to deg/s
   float fused_gx_deg = fused_gx_rad * (180.0f / M_PI);
   float fused_gy_deg = fused_gy_rad * (180.0f / M_PI);
   float fused_gz_deg = fused_gz_rad * (180.0f / M_PI);
 
-  // 3. EKF Filter Update with aligned sensor frames
+  // 3. EKF Filter Update
   fusedEKF.predict(fused_gx_rad, fused_gy_rad, fused_gz_rad, dt);
   fusedEKF.update(mpu_ax, mpu_ay, mpu_az);
-  fusedEKF.update(icm_ax_body, icm_ay_body, icm_az_body);
+  fusedEKF.update(icm_ax, icm_ay, icm_az);
 
   static uint32_t powerTimer = 0;
 
@@ -316,15 +307,17 @@ void loop() {
     powerMonitor.read(powerData);
   }
 
+
   // 4. Closed-loop control
   if (baseThrottlePercent > 0.0f) {
     float angle_kp = 4.0f;
     float desired_roll_rate  = angle_kp * (0.0f - fusedEKF.roll);
-    float desired_pitch_rate = angle_kp * (0.0f - fusedEKF.pitch);
+    float desired_pitch_rate  = angle_kp * (0.0f - fusedEKF.pitch);
+    //float desired_yaw_rate  = angle_kp * (0.0f - fusedEKF.yaw);
 
-    float roll_output  = PID_update(&roll_pid,  desired_roll_rate, fused_gx_deg, dt);
-    float pitch_output = PID_update(&pitch_pid, desired_pitch_rate, fused_gy_deg, dt);
-    float yaw_output   = PID_update(&yaw_pid,   0.0f, fused_gz_deg, dt);
+    float roll_output  = PID_update(&roll_pid, 0.0f ,fusedEKF.roll, dt);
+    float pitch_output = PID_update(&pitch_pid, 0.0f, fusedEKF.pitch, dt);
+    float yaw_output   = PID_update(&yaw_pid,   0.0f,   fusedEKF.yaw, dt);
 
     // Quad X Motor Mix
     m1_throttle = baseThrottlePercent + pitch_output - roll_output - yaw_output;
@@ -369,13 +362,12 @@ void loop() {
 
       char plotBuffer[256];
       snprintf(plotBuffer, sizeof(plotBuffer),
-              "Throttle:%.2f Roll:%.2f Pitch:%.2f Yaw:%.2f "
+              "Throttle:%.2f Roll:%.2f Pitch:%.2f "
               "M1:%.2f M2:%.2f M3:%.2f M4:%.2f "
-              "Voltage:%.2f Current:%.2f Power:%.2f ",
+              "Voltage:%.2f Current:%.2f Power:%.2f",
               baseThrottlePercent,
               fusedEKF.roll,
               fusedEKF.pitch,
-              fusedEKF.yaw,
               filtered_m1,
               filtered_m2,
               filtered_m3,
