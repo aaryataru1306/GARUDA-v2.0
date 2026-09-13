@@ -5,12 +5,12 @@
 // PINS (Teensy 4.1)
 // ===============================
 const int PIN_MOSI = 26; 
-const int PIN_MISO = 1;  
+const int PIN_MISO = 39;  
 const int PIN_SCK  = 27; 
-const int PIN_CS   = 0; 
-const int PIN_BUSY = 3; 
-const int PIN_RST  = 2; 
-const int PIN_DIO1 = 4; 
+const int PIN_CS   = 8; 
+const int PIN_BUSY = 7; 
+const int PIN_RST  = 5; 
+const int PIN_DIO1 = 6; 
 
 // ===============================
 // CUSTOM BIT-BANG HAL FOR RADIOLIB
