@@ -3,12 +3,35 @@
 
 #include <math.h>
 
+// ============================================================
+// EKF_IMU  -  Quaternion-measurement Extended Kalman Filter
+//
+// New architecture (matches the "EKF - actual mathematics for
+// quaternion attitude fusion" reference):
+//
+//   MPU raw data  -> Madgwick -> q_MPU  \
+//                                         >--> EKF (this class) -> q_FINAL -> RPY
+//   ICM raw data  -> Madgwick -> q_ICM  /
+//
+// predict()  : propagates the state quaternion using gyro data,
+//              exactly like a normal quaternion-kinematics EKF.
+// update()   : takes ONE already-computed quaternion (either
+//              q_MPU or q_ICM) as a direct measurement, i.e.
+//              z = q, H = Identity(4x4).
+//
+// Because the measurement noise is uncorrelated between the two
+// sensors, calling update() twice per loop (once with q_MPU, once
+// with q_ICM) is mathematically identical to stacking them into a
+// single 8-length measurement vector and doing one 8x8 solve - but
+// it only ever needs a 4x4 inversion, which is far cheaper on a
+// Teensy. This is the "sequential measurement update" trick.
+// ============================================================
 class EKF_IMU {
 public:
     // State: Quaternion [q0, q1, q2, q3]
     float q[4];
 
-    // Estimated Euler Angles (in degrees)
+    // Estimated Euler Angles (in degrees), updated after every update()
     float roll;
     float pitch;
     float yaw;
@@ -19,23 +42,24 @@ public:
     // Process Noise Variance (Gyroscope)
     float Q_gyro;
 
-    // Measurement Noise Variance (Accelerometer)
-    float R_accel;
+    // Measurement Noise Variance for each source quaternion.
+    // Smaller = "I trust this sensor's Madgwick output more".
+    float R_mpu;
+    float R_icm;
 
-    EKF_IMU(float gyro_noise = 0.005f, float accel_noise = 0.5f) {
+    EKF_IMU(float gyro_noise = 0.005f, float meas_noise_mpu = 0.05f, float meas_noise_icm = 0.05f) {
         Q_gyro = gyro_noise;
-        R_accel = accel_noise;
+        R_mpu  = meas_noise_mpu;
+        R_icm  = meas_noise_icm;
         reset();
     }
 
     void reset() {
-        // Initial quaternion (Identity / Level)
         q[0] = 1.0f;
         q[1] = 0.0f;
         q[2] = 0.0f;
         q[3] = 0.0f;
 
-        // Initialize Covariance Matrix to small identity
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
                 P[i][j] = (i == j) ? 0.01f : 0.0f;
@@ -47,6 +71,7 @@ public:
 
     // --- 1. PREDICT STEP ---
     // Inputs: gx, gy, gz in radians/sec, dt in seconds
+    // (Same quaternion-kinematics propagation as the original filter.)
     void predict(float gx, float gy, float gz, float dt) {
         float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
 
@@ -94,87 +119,70 @@ public:
         normalizeQuaternion();
     }
 
-    // --- 2. UPDATE STEP ---
-    // Inputs: ax, ay, az (normalized or raw accelerometer readings)
-    void update(float ax, float ay, float az) {
-        // Normalize accelerometer readings
-        float norm = sqrtf(ax * ax + ay * ay + az * az);
-        if (norm < 0.0001f) return; // Discard invalid reading
-        ax /= norm;
-        ay /= norm;
-        az /= norm;
+    // --- Innovation-based sensor selection helper ---
+    // Returns a "distance" between the EKF's current predicted quaternion
+    // and a candidate measurement quaternion: 0 = identical orientation,
+    // up to 1 = maximally different. Handles the q / -q sign ambiguity
+    // (same rotation) by taking the absolute value of the dot product.
+    // Call this on q_MPU and q_ICM right after predict(); whichever comes
+    // back smaller is the one to feed into update() this cycle.
+    float residualMagnitude(const float qMeas[4]) const {
+        float dot = q[0]*qMeas[0] + q[1]*qMeas[1] + q[2]*qMeas[2] + q[3]*qMeas[3];
+        return 1.0f - fabsf(dot);
+    }
 
-        float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+    // --- 2. UPDATE STEP (direct quaternion measurement, H = I) ---
+    // qMeas : a unit quaternion coming out of one of the Madgwick
+    //         filters (q_MPU or q_ICM).
+    // R     : measurement noise variance to use for this source
+    //         (pass R_mpu or R_icm from the call site).
+    void update(const float qMeas[4], float R) {
 
-        // Measurement Model h(q): Estimated gravity vector in body frame
-        float h[3] = {
-            2.0f * (q1 * q3 - q0 * q2),
-            2.0f * (q0 * q1 + q2 * q3),
-            q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3
-        };
+        // Quaternion sign ambiguity: q and -q represent the same
+        // rotation. If the measurement is pointing the "opposite way"
+        // in quaternion space relative to our current estimate, flip
+        // its sign before using it, or the innovation will blow up.
+        float dot = q[0]*qMeas[0] + q[1]*qMeas[1] + q[2]*qMeas[2] + q[3]*qMeas[3];
+        float sign = (dot < 0.0f) ? -1.0f : 1.0f;
+        float z[4] = { sign*qMeas[0], sign*qMeas[1], sign*qMeas[2], sign*qMeas[3] };
 
-        // Innovation / Residual: y = z - h(q)
-        float y[3] = { ax - h[0], ay - h[1], az - h[2] };
+        // Innovation: y = z - h(q), h(q) = q  (H = Identity)
+        float y[4];
+        for (int i = 0; i < 4; i++) y[i] = z[i] - q[i];
 
-        // Measurement Jacobian H (3x4)
-        float H[3][4] = {
-            { -2.0f * q2,   2.0f * q3,  -2.0f * q0,   2.0f * q1 },
-            {  2.0f * q1,   2.0f * q0,   2.0f * q3,   2.0f * q2 },
-            {  2.0f * q0,  -2.0f * q1,  -2.0f * q2,   2.0f * q3 }
-        };
-
-        // P * H^T (4x3)
-        float PHT[4][3] = {0};
+        // Innovation covariance: S = H*P*H^T + R = P + R*I
+        float S[4][4];
         for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 3; j++) {
+            for (int j = 0; j < 4; j++) {
+                S[i][j] = P[i][j] + ((i == j) ? R : 0.0f);
+            }
+        }
+
+        float S_inv[4][4];
+        if (!invert4x4(S, S_inv)) return; // singular - skip this update
+
+        // Kalman Gain: K = P * H^T * S_inv = P * S_inv  (since H = I)
+        float K[4][4] = {0};
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
                 for (int k = 0; k < 4; k++) {
-                    PHT[i][j] += P[i][k] * H[j][k];
+                    K[i][j] += P[i][k] * S_inv[k][j];
                 }
             }
         }
 
-        // S = H * (P * H^T) + R (3x3)
-        float S[3][3] = {0};
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                float sum = 0.0f;
-                for (int k = 0; k < 4; k++) {
-                    sum += H[i][k] * PHT[k][j];
-                }
-                S[i][j] = sum + (i == j ? R_accel : 0.0f);
-            }
-        }
-
-        // Invert 3x3 Matrix S using analytic matrix inversion
-        float S_inv[3][3];
-        if (!invert3x3(S, S_inv)) return;
-
-        // Kalman Gain: K = (P * H^T) * S_inv (4x3)
-        float K[4][3] = {0};
+        // State update: q = q + K*y
         for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 3; j++) {
-                for (int k = 0; k < 3; k++) {
-                    K[i][j] += PHT[i][k] * S_inv[k][j];
-                }
-            }
-        }
-
-        // Update State: q = q + K * y
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 3; j++) {
+            for (int j = 0; j < 4; j++) {
                 q[i] += K[i][j] * y[j];
             }
         }
 
-        // Update Covariance: P = (I - K * H) * P
-        float I_KH[4][4];
+        // Covariance update: P = (I - K) * P   (since H = I)
+        float IK[4][4];
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
-                float sum = (i == j) ? 1.0f : 0.0f;
-                for (int k = 0; k < 3; k++) {
-                    sum -= K[i][k] * H[k][j];
-                }
-                I_KH[i][j] = sum;
+                IK[i][j] = ((i == j) ? 1.0f : 0.0f) - K[i][j];
             }
         }
 
@@ -182,16 +190,13 @@ public:
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
                 for (int k = 0; k < 4; k++) {
-                    P_new[i][j] += I_KH[i][k] * P[k][j];
+                    P_new[i][j] += IK[i][k] * P[k][j];
                 }
             }
         }
-
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
                 P[i][j] = P_new[i][j];
-            }
-        }
 
         normalizeQuaternion();
         computeEulerAngles();
@@ -209,46 +214,69 @@ private:
     }
 
     void computeEulerAngles() {
-        // Roll (X-axis rotation)
         float sinr_cosp = 2.0f * (q[0] * q[1] + q[2] * q[3]);
         float cosr_cosp = 1.0f - 2.0f * (q[1] * q[1] + q[2] * q[2]);
         roll = atan2f(sinr_cosp, cosr_cosp) * (180.0f / M_PI);
 
-        // Pitch (Y-axis rotation)
         float sinp = 2.0f * (q[0] * q[2] - q[3] * q[1]);
         if (fabsf(sinp) >= 1.0f) {
-            pitch = copysignf(90.0f, sinp); // 90 degrees if out of range
+            pitch = copysignf(90.0f, sinp);
         } else {
             pitch = asinf(sinp) * (180.0f / M_PI);
         }
 
-        // Yaw (Z-axis rotation)
         float siny_cosp = 2.0f * (q[0] * q[3] + q[1] * q[2]);
         float cosy_cosp = 1.0f - 2.0f * (q[2] * q[2] + q[3] * q[3]);
         yaw = atan2f(siny_cosp, cosy_cosp) * (180.0f / M_PI);
     }
 
-    // Analytic inversion for 3x3 matrix
-    bool invert3x3(const float A[3][3], float inv[3][3]) {
-        float det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) -
-                    A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
-                    A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+    // Generic 4x4 matrix inversion via Gauss-Jordan elimination with
+    // partial pivoting. Needed because S = P + R*I is a general
+    // symmetric 4x4 matrix (not the 3x3 accel-only case the old
+    // filter had an analytic formula for).
+    bool invert4x4(const float Ain[4][4], float inv[4][4]) {
+        float A[4][8];
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) A[i][j] = Ain[i][j];
+            for (int j = 0; j < 4; j++) A[i][4 + j] = (i == j) ? 1.0f : 0.0f;
+        }
 
-        if (fabsf(det) < 1e-6f) return false;
+        for (int col = 0; col < 4; col++) {
+            // Partial pivot
+            int pivotRow = col;
+            float maxVal = fabsf(A[col][col]);
+            for (int r = col + 1; r < 4; r++) {
+                if (fabsf(A[r][col]) > maxVal) {
+                    maxVal = fabsf(A[r][col]);
+                    pivotRow = r;
+                }
+            }
+            if (maxVal < 1e-9f) return false; // singular
 
-        float invDet = 1.0f / det;
+            if (pivotRow != col) {
+                for (int k = 0; k < 8; k++) {
+                    float tmp = A[col][k];
+                    A[col][k] = A[pivotRow][k];
+                    A[pivotRow][k] = tmp;
+                }
+            }
 
-        inv[0][0] = (A[1][1] * A[2][2] - A[1][2] * A[2][1]) * invDet;
-        inv[0][1] = (A[0][2] * A[2][1] - A[0][0] * A[2][2]) * invDet; // cofactor transposed
-        inv[0][2] = (A[0][1] * A[1][2] - A[0][2] * A[1][1]) * invDet;
+            float pivot = A[col][col];
+            for (int k = 0; k < 8; k++) A[col][k] /= pivot;
 
-        inv[1][0] = (A[1][2] * A[2][0] - A[1][0] * A[2][2]) * invDet;
-        inv[1][1] = (A[0][0] * A[2][2] - A[0][2] * A[2][0]) * invDet;
-        inv[1][2] = (A[0][2] * A[1][0] - A[0][0] * A[1][2]) * invDet;
+            for (int r = 0; r < 4; r++) {
+                if (r == col) continue;
+                float factor = A[r][col];
+                if (factor == 0.0f) continue;
+                for (int k = 0; k < 8; k++) {
+                    A[r][k] -= factor * A[col][k];
+                }
+            }
+        }
 
-        inv[2][0] = (A[1][0] * A[2][1] - A[1][1] * A[2][0]) * invDet;
-        inv[2][1] = (A[0][1] * A[2][0] - A[0][0] * A[2][1]) * invDet;
-        inv[2][2] = (A[0][0] * A[1][1] - A[0][1] * A[1][0]) * invDet;
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                inv[i][j] = A[i][4 + j];
 
         return true;
     }
