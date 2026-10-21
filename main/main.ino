@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <math.h>
-#include <string.h>
 
 #include "mpu.h"
 #include "icm.h"
@@ -9,34 +8,27 @@
 #include "bmp581.h"
 #include "L89H_GPS.h"
 #include "Lora_radio.h"
+#include "fsm.h"
 
 // ============================================================
 // CONSTANTS & TEAM CONFIG
 // ============================================================
 const char* TEAM_ID = "021";
-#define led_pin 14
+constexpr int LED_PIN = 14;
+
 // ============================================================
-// LORA RADIO INSTANTATION & HELPERS
+// LORA RADIO INSTANTIATION & HELPERS
 // ============================================================
 BitBangHal radioHal;
-// SX1262 pin mapping passed to RadioLib module wrapper
 Module loraModule(&radioHal, PIN_CS, PIN_DIO1, PIN_RST, PIN_BUSY);
 SX1262 loraRadio = &loraModule;
 
 bool loraAvailable = false;
 
-// Telemetry is disabled until the GCS sends CMD:START over LoRa.
-bool telemetryEnabled = false;
-volatile bool radioPacketReceived = false;
-
-void onRadioPacketReceived() {
-    radioPacketReceived = true;
-}
-
 bool setupLoRa() {
     Serial.println("Initializing SX1262 LoRa via BitBang SPI...");
     int state = loraRadio.begin(867.0, 125.0, 7, 7, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, 10, 8);
-    
+
     if (state == RADIOLIB_ERR_NONE) {
         Serial.println("SX1262 LoRa initialized successfully.");
         return true;
@@ -47,16 +39,17 @@ bool setupLoRa() {
     }
 }
 
-bool transmitLoRaBuffer(const char* buffer) {
-    if (!loraAvailable) return false;
-
-    int state = loraRadio.transmit((uint8_t*)buffer, strlen(buffer));
-    // The radio is half-duplex: always return to command/telemetry RX.
-    loraRadio.startReceive();
-    return (state == RADIOLIB_ERR_NONE);
+void checkGPIO21State() {
+    int pinState = digitalRead(NICHROME_MOSFET_PIN);
+    Serial.print("[HW CHECK] NICHROME_MOSFET_PIN (GPIO 21) State: ");
+    Serial.println(pinState == HIGH ? "HIGH" : "LOW");
 }
 
-
+bool transmitLoRaBuffer(const char* buffer) {
+    if (!loraAvailable) return false;
+    int state = loraRadio.transmit((uint8_t*)buffer, strlen(buffer));
+    return (state == RADIOLIB_ERR_NONE);
+}
 
 // ============================================================
 // SENSOR CONFIGURATION
@@ -65,7 +58,10 @@ SPISettings sensorSPI(1000000, MSBFIRST, SPI_MODE0);
 
 MPU9250 mpu(10, sensorSPI);
 ICM20948 icm(9, sensorSPI);
-L89H_GPS gpsSens(Serial2); // Hardware Serial2 on Teensy 4.1
+L89H_GPS gpsSens(Serial2); // Hardware Serial2 on Pins 34 (RX2) and 35 (TX2)
+
+FlightFSM fsm;
+uint8_t lastFlightEvent = EVENT_NONE;
 
 // ============================================================
 // FILTER & TELEMETRY TIMING CONFIGURATION
@@ -80,36 +76,9 @@ constexpr uint32_t LORA_TX_INTERVAL_MS = 500; // 2Hz Telemetry Rate
 uint32_t previousLoraTxMillis = 0;
 uint32_t packetCount = 0;
 
-void processRadioCommand() {
-    if (!radioPacketReceived || !loraAvailable) return;
-
-    noInterrupts();
-    radioPacketReceived = false;
-    interrupts();
-
-    String command;
-    int state = loraRadio.readData(command);
-
-    if (state != RADIOLIB_ERR_NONE) {
-        loraRadio.startReceive();
-        return;
-    }
-
-    command.trim();
-    command.toUpperCase();
-
-    if (command == "CMD:START") {
-        telemetryEnabled = true;
-        packetCount = 0;
-        previousLoraTxMillis = millis() - LORA_TX_INTERVAL_MS;
-        transmitLoRaBuffer("ACK:START");
-    } else if (command == "CMD:STOP") {
-        telemetryEnabled = false;
-        transmitLoRaBuffer("ACK:STOP");
-    } else {
-        loraRadio.startReceive();
-    }
-}
+// Non-blocking LED blink timer
+uint32_t ledTurnOffMillis = 0;
+bool ledActive = false;
 
 // Voltage Sensing setup
 constexpr int VOLTAGE_SENSE_PIN = A9;
@@ -118,32 +87,21 @@ float getVoltage() {
     return (raw / 1023.0f) * 3.3f * 4.0f; // Adjust resistor divider factor as needed
 }
 
-// ============================================================
-// BMP581 / ASCENT DETECTION
-// ============================================================
-constexpr uint32_t BARO_SAMPLE_INTERVAL_MS = 100;
-constexpr float BARO_MIN_ALTITUDE_CHANGE_M = 0.02f;
-constexpr float BARO_ASCENT_VELOCITY_THRESHOLD_MPS = 0.25f;
-constexpr uint8_t ASCENT_REQUIRED_SAMPLES = 7;
-constexpr float BARO_VELOCITY_FILTER_TAU = 0.5f;
+// PM02D Power Monitor Current Sensing Setup (Pin A8 / GPIO 22)
+constexpr int PM02D_CURRENT_PIN = A8;
+float getPM02DCurrent() {
+    float raw = analogRead(PM02D_CURRENT_PIN);
+    float voltage = (raw / 1023.0f) * 3.3f;
+    // PM02D scale factor: 36.36 A/V
+    return voltage * 36.36f;
+}
 
-enum FlightState : uint8_t {
-    WAITING_FOR_ASCENT = 0,
-    ASCENT
-};
-
-FlightState flightState = WAITING_FOR_ASCENT;
+// ============================================================
+// BAROMETER STATE
+// ============================================================
 bool bmp581Available = false;
-bool baroAltitudeInitialized = false;
-bool baroVelocityInitialized = false;
 float baroReferencePressurePa = NAN;
 float baroAltitudeM = NAN;
-float previousBaroAltitudeM = NAN;
-float baroVerticalVelocityMps = 0.0f;
-uint8_t ascentConsecutiveSamples = 0;
-uint32_t previousBaroSampleMillis = 0;
-uint32_t previousBaroSampleMicros = 0;
-uint32_t previousBaroStatusMillis = 0;
 
 // ============================================================
 // SENSOR DATA
@@ -374,7 +332,7 @@ void initializeBarometer() {
     Serial.println("Initializing BMP581...");
     if (!BMP581_Begin()) {
         bmp581Available = false;
-        Serial.println("BMP581 initialization failed; ascent detection unavailable.");
+        Serial.println("BMP581 initialization failed.");
         return;
     }
 
@@ -388,81 +346,64 @@ void initializeBarometer() {
 
     if (!isfinite(referencePressure) || referencePressure <= 0.0f) {
         bmp581Available = false;
-        Serial.println("BMP581 pressure read failed.");
+        Serial.println("BMP581 reference pressure read failed.");
         return;
     }
 
     baroReferencePressurePa = referencePressure;
     bmp581Available = true;
-    baroAltitudeInitialized = false;
-    baroVelocityInitialized = false;
-    baroVerticalVelocityMps = 0.0f;
-    ascentConsecutiveSamples = 0;
-    flightState = WAITING_FOR_ASCENT;
-    previousBaroSampleMillis = millis();
-    previousBaroSampleMicros = micros();
-    previousBaroStatusMillis = millis();
+
+    baroAltitudeM = BMP581_ReadAltitude(baroReferencePressurePa);
+    if (!isfinite(baroAltitudeM)) baroAltitudeM = 0.0f;
+
+    fsm.init(baroAltitudeM);
+
+    Serial.print("BMP581 ready. Reference pressure: ");
+    Serial.print(baroReferencePressurePa, 2);
+    Serial.println(" Pa");
 }
 
-void updateAscentDetection() {
-    if (!bmp581Available || flightState == ASCENT) return;
+void updateFlightFSM(float dt) {
+    if (!bmp581Available) return;
 
-    const uint32_t nowMillis = millis();
-    if (nowMillis - previousBaroSampleMillis < BARO_SAMPLE_INTERVAL_MS) return;
+    float currentAlt = BMP581_ReadAltitude(baroReferencePressurePa);
+    float currentPM02DAmps = getPM02DCurrent();
 
-    const uint32_t nowMicros = micros();
-    const uint32_t elapsedMicros = nowMicros - previousBaroSampleMicros;
-    previousBaroSampleMillis = nowMillis;
-    previousBaroSampleMicros = nowMicros;
+    if (isfinite(currentAlt)) {
+        baroAltitudeM = currentAlt;
+        fsm.update(baroAltitudeM, dt, currentPM02DAmps);
 
-    if (elapsedMicros == 0U) {
-        ascentConsecutiveSamples = 0;
-        return;
-    }
-
-    const float sampleDt = static_cast<float>(elapsedMicros) * 1.0e-6f;
-    const float newAltitudeM = BMP581_ReadAltitude(baroReferencePressurePa);
-
-    if (!isfinite(newAltitudeM)) {
-        ascentConsecutiveSamples = 0;
-        return;
-    }
-
-    baroAltitudeM = newAltitudeM;
-
-    if (!baroAltitudeInitialized) {
-        previousBaroAltitudeM = baroAltitudeM;
-        baroAltitudeInitialized = true;
-        return;
-    }
-
-    const float altitudeChangeM = baroAltitudeM - previousBaroAltitudeM;
-    const float rawVerticalVelocityMps = altitudeChangeM / sampleDt;
-    previousBaroAltitudeM = baroAltitudeM;
-
-    if (!baroVelocityInitialized) {
-        baroVerticalVelocityMps = rawVerticalVelocityMps;
-        baroVelocityInitialized = true;
-    } else {
-        const float alpha = sampleDt / (BARO_VELOCITY_FILTER_TAU + sampleDt);
-        baroVerticalVelocityMps += alpha * (rawVerticalVelocityMps - baroVerticalVelocityMps);
-    }
-
-    const bool altitudeIncreasing = altitudeChangeM > BARO_MIN_ALTITUDE_CHANGE_M;
-    const bool velocityIncreasing = baroVerticalVelocityMps > BARO_ASCENT_VELOCITY_THRESHOLD_MPS;
-
-    if (altitudeIncreasing && velocityIncreasing) {
-        if (ascentConsecutiveSamples < ASCENT_REQUIRED_SAMPLES) {
-            ++ascentConsecutiveSamples;
+        if (fsm.getEvent() != EVENT_NONE) {
+            lastFlightEvent = fsm.getEvent();
         }
-    } else {
-        ascentConsecutiveSamples = 0;
+    }
+}
+
+void printFlightStatus() {
+    static uint32_t prevPrintMs = 0;
+    if (millis() - prevPrintMs < PRINT_INTERVAL_MS) return;
+    prevPrintMs = millis();
+
+    Serial.print("State: ");
+    switch (fsm.getState()) {
+        case STATE_PAD_IDLE:           Serial.print("PAD_IDLE"); break;
+        case STATE_ASCENT:             Serial.print("ASCENT"); break;
+        case STATE_APOGEE:             Serial.print("APOGEE"); break;
+        case STATE_DESCENT:            Serial.print("DESCENT"); break;
+        case STATE_ARMS_OPENING:       Serial.print("ARMS_OPENING"); break;
+        case STATE_ARM_DEPLOYED:       Serial.print("ARM_DEPLOYED"); break;
+        case STATE_MOTOR_HEALTH_CHECK: Serial.print("MOTOR_HEALTH_CHECK"); break;
+        case STATE_TOUCHDOWN:          Serial.print("TOUCHDOWN"); break;
+        case STATE_LANDED:             Serial.print("LANDED"); break;
     }
 
-    if (ascentConsecutiveSamples >= ASCENT_REQUIRED_SAMPLES) {
-        flightState = ASCENT;
-        Serial.println("ASCENT DETECTED");
-    }
+    Serial.print(" | Alt: ");
+    Serial.print(baroAltitudeM, 2);
+    Serial.print(" m | Vz: ");
+    Serial.print(fsm.getVerticalVelocity(), 3);
+
+    Serial.print(" m/s | GPIO36: ");
+    Serial.println(digitalRead(ARM_FEEDBACK_PIN) == LOW ? "CLOSED (ARM DEPLOYED)" : "OPEN (NOT DEPLOYED)");
 }
 
 void ppm_isr() {
@@ -594,37 +535,36 @@ void updateMotorControl(float dt) {
     writeMotorThrottle(MOTOR4_PIN, filtered_m4);
 }
 
-// ============================================================
-// TELEMETRY BROADCAST
-// ============================================================
 void sendTelemetry() {
     uint32_t now = millis();
+
+    // Turn off Tx LED asynchronously without blocking execution
+    if (ledActive && (now >= ledTurnOffMillis)) {
+        digitalWrite(LED_PIN, LOW);
+        ledActive = false;
+    }
+
     if (now - previousLoraTxMillis < LORA_TX_INTERVAL_MS) return;
     previousLoraTxMillis = now;
 
     packetCount++;
 
-    // Altitude, Pressure, Temperature readouts from BMP581
-    float bmpAltitudeM = baroAltitudeM;
+    float bmpAltitudeM_read = baroAltitudeM;
     float bmpPressurePa = BMP581_ReadPressure();
     float bmpTemperatureC = BMP581_ReadTemperature();
 
-    // Voltage
     struct { float voltageV; } powerData = { getVoltage() };
 
-    // GPS Data
     uint32_t gnssTime = gpsSens.getGNSSTime();
     double gpsLatitude = gpsSens.getLatitude();
     double gpsLongitude = gpsSens.getLongitude();
     float gpsAltitudeM = gpsSens.getAltitudeMeters();
     uint32_t gpsSatellites = gpsSens.getSatellites();
 
-    // Rates converted to deg/s
     float fused_gx_deg = radiansToDegrees(gx);
     float fused_gy_deg = radiansToDegrees(gy);
     float fused_gz_deg = radiansToDegrees(gz);
 
-    // EKF/Filter Attitude converted to deg
     struct { float roll; float pitch; float yaw; } fusedEKF = {
         radiansToDegrees(roll),
         radiansToDegrees(pitch),
@@ -638,9 +578,9 @@ void sendTelemetry() {
         "%lu,%.6f,%.6f,%.1f,%lu,"
         "%.3f,%.3f,%.3f,"
         "%.1f,%.1f,%.1f,"
-        "%.1f,%.1f,%.1f,%d",
+        "%.1f,%.1f,%.1f,%d,%u",
         TEAM_ID, (unsigned long)now, (unsigned long)packetCount,
-        isnan(bmpAltitudeM) ? -999.0f : bmpAltitudeM,
+        isnan(bmpAltitudeM_read) ? -999.0f : bmpAltitudeM_read,
         isnan(bmpPressurePa) ? -999.0f : bmpPressurePa,
         isnan(bmpTemperatureC) ? -999.0f : bmpTemperatureC,
         powerData.voltageV, (unsigned long)gnssTime,
@@ -648,29 +588,30 @@ void sendTelemetry() {
         0.5f * (mpuAx + icmAx), 0.5f * (mpuAy + icmAy), 0.5f * (mpuAz + icmAz),
         fused_gx_deg, fused_gy_deg, fused_gz_deg,
         fusedEKF.roll, fusedEKF.pitch, fusedEKF.yaw,
-        (int)flightState
+        (int)fsm.getState(),
+        lastFlightEvent
     );
 
     if (transmitLoRaBuffer(loraBuffer)) {
-        Serial.print("LoRa Tx OK: ");
-        Serial.println(loraBuffer);
-        digitalWrite(led_pin, HIGH);
-        delay(10);
-        digitalWrite(led_pin, LOW);
+        // Serial.print("LoRa Tx OK: ");
+        // Serial.println(loraBuffer);
 
+        digitalWrite(LED_PIN, HIGH);
+        ledTurnOffMillis = now + 50; // Non-blocking 50ms LED pulse
+        ledActive = true;
     } else {
         Serial.println("LoRa Tx Failed/Busy");
     }
 }
 
-// ============================================================
-// SETUP
-// ============================================================
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 3000) {}
 
     Serial.println("\nTeensy 4.1 Dual-IMU Avionics System");
+
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
 
     SPI.begin();
 
@@ -694,26 +635,11 @@ void setup() {
 
     mpu.calibrate(2000);
     icm.calibrate(2000);
+    checkGPIO21State();
 
     initializeBarometer();
     gpsSens.begin(9600);
     loraAvailable = setupLoRa();
-
-    if (loraAvailable) {
-        loraRadio.setDio2AsRfSwitch(true);
-        loraRadio.setPacketReceivedAction(onRadioPacketReceived);
-
-        int rxState = loraRadio.startReceive();
-        if (rxState != RADIOLIB_ERR_NONE) {
-            Serial.print("LoRa RX start failed, code: ");
-            Serial.println(rxState);
-            loraAvailable = false;
-        } else {
-            Serial.println("LoRa command RX ready; telemetry waits for CMD:START.");
-        }
-    }
-
-    telemetryEnabled = false;
 
     pinMode(RX_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(RX_PIN), ppm_isr, RISING);
@@ -734,14 +660,7 @@ void setup() {
     Serial.println("Setup complete.");
 }
 
-// ============================================================
-// MAIN LOOP
-// ============================================================
 void loop() {
-    // Poll radio commands before sensor/control processing so START/STOP
-    // still work when telemetry is disabled.
-    processRadioCommand();
-
     const uint32_t nowMicros = micros();
     const float dt = (nowMicros - previousMicros) * 1.0e-6f;
     previousMicros = nowMicros;
@@ -758,7 +677,8 @@ void loop() {
     }
 
     updateMagnetometer();
-    updateAscentDetection();
+    updateFlightFSM(dt);
+    printFlightStatus();
 
     if (!filterInitialized) {
         initializeFilter();
@@ -766,9 +686,20 @@ void loop() {
         updateAttitude(dt);
     }
 
-    updateMotorControl(dt);
-
-    if (telemetryEnabled) {
-        sendTelemetry();
+    // Execute motor driving logic based on FSM state
+    if (fsm.isMotorTestingActive()) {
+        // Command 30% test throttle during PM02D motor health check
+        writeMotorThrottle(MOTOR1_PIN, TEST_THROTTLE_PERCENT);
+        writeMotorThrottle(MOTOR2_PIN, TEST_THROTTLE_PERCENT);
+        writeMotorThrottle(MOTOR3_PIN, TEST_THROTTLE_PERCENT);
+        writeMotorThrottle(MOTOR4_PIN, TEST_THROTTLE_PERCENT);
+    } else if (fsm.isPidUnlocked()) {
+        // Normal flight attitude control loop via PID
+        updateMotorControl(dt);
+    } else {
+        // Stop motors if test failed or disarmed
+        writeAllMotorsRaw(ESC_MIN_US);
     }
+
+    sendTelemetry();
 }
